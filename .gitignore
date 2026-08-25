@@ -1,0 +1,11 @@
+# Nunca subir secretos al repo. Las variables van en Railway > Variables.
+.env
+.env.*
+*.pem
+*.key
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
