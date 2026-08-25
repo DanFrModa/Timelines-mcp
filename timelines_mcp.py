@@ -334,17 +334,14 @@ def _format_error(exc: Exception, url: str) -> str:
     return f"Error: unexpected {type(exc).__name__}: {exc}"
 
 
-def _retry_after_seconds(exc: Exception) -> Optional[float]:
-    """Seconds to wait per the server's Retry-After header, when it sent one.
+def _retry_after_from_response(response: "httpx.Response") -> float:
+    """Seconds to wait per the server's Retry-After header, with a sane fallback.
 
-    TimelinesAI returns Retry-After on a 429. Honouring it beats guessing: too
-    short and the retry is refused again, too long and a scan crawls.
+    Honouring the header beats guessing: too short and the retry is refused
+    again, too long and everything crawls. The value is capped so a malformed or
+    hostile header cannot stall the server for hours.
     """
-    if not isinstance(exc, httpx.HTTPStatusError):
-        return None
-    if exc.response.status_code != 429:
-        return None
-    raw = exc.response.headers.get("retry-after", "").strip()
+    raw = response.headers.get("retry-after", "").strip()
     if not raw:
         return DEFAULT_RETRY_AFTER
     try:
@@ -352,6 +349,15 @@ def _retry_after_seconds(exc: Exception) -> Optional[float]:
     except ValueError:
         # The header may be an HTTP date rather than a count of seconds.
         return DEFAULT_RETRY_AFTER
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Seconds to wait after a 429, or None when the error is not a 429."""
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    if exc.response.status_code != 429:
+        return None
+    return _retry_after_from_response(exc.response)
 
 
 def _check_write_allowed(method: str, path: str, confirmed: bool) -> None:
@@ -396,6 +402,35 @@ def _check_write_allowed(method: str, path: str, confirmed: bool) -> None:
         )
 
 
+class _Throttle:
+    """Process-wide pacer that keeps outbound calls under the documented rate.
+
+    The 50/minute limit is per workspace, and every tool in this server shares
+    one workspace, so the pacing has to be shared too. Spacing requests at the
+    source is better than reacting to 429s: a rejected request still costs a
+    round trip, and the failure lands mid-task rather than up front.
+
+    An isolated call waits for nothing — the delay only appears when a previous
+    call happened less than MIN_REQUEST_INTERVAL ago, which is exactly the burst
+    case that trips the limit.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._last: float = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            gap = now - self._last
+            if gap < MIN_REQUEST_INTERVAL:
+                await asyncio.sleep(MIN_REQUEST_INTERVAL - gap)
+            self._last = asyncio.get_event_loop().time()
+
+
+_throttle = _Throttle()
+
+
 async def _api_request(
     method: str,
     path: str,
@@ -404,7 +439,12 @@ async def _api_request(
     body: Optional[Any] = None,
     confirmed: bool = False,
 ) -> Tuple[int, Any, str]:
-    """Perform an authenticated request. Returns (status, parsed_body, final_url)."""
+    """Perform an authenticated request. Returns (status, parsed_body, final_url).
+
+    Paces itself against the workspace rate limit and, for reads, retries once
+    when the server answers 429. Writes are never retried automatically: a send
+    that may or may not have gone out is not something to repeat on a guess.
+    """
     method = method.upper()
     url = _normalize_path(path)
     # Gate on the normalized URL so that "/messages" and "/integrations/api/messages"
@@ -419,9 +459,19 @@ async def _api_request(
     if body is not None:
         headers["Content-Type"] = "application/json"
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
-        response = await client.request(method, url, headers=headers, json=body)
+    # Reads are safe to repeat; a write is not, so it gets one shot.
+    attempts = 2 if method == "GET" else 1
+    response = None
+    for attempt in range(attempts):
+        await _throttle.wait()
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+            response = await client.request(method, url, headers=headers, json=body)
+        if response.status_code != 429 or attempt == attempts - 1:
+            break
+        # Wait exactly as long as the server asked before the single retry.
+        await asyncio.sleep(_retry_after_from_response(response))
 
+    assert response is not None
     raw = response.text
     try:
         parsed: Any = response.json()
@@ -1581,36 +1631,20 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
         if params.filters:
             query.update(params.filters)
 
-        # Stay under the documented 50 requests/minute. A scan is the one place
-        # that reliably exceeds it, and exceeding it fails halfway rather than
-        # up front.
-        if page > 1:
-            await asyncio.sleep(MIN_REQUEST_INTERVAL)
-
+        # Pacing and 429 retries live in _api_request now, so every tool gets
+        # them, not just this one.
         try:
             _, data, url = await _api_request("GET", "/chats", query=query)
         except Exception as exc:  # noqa: BLE001 - handled below
-            wait = _retry_after_seconds(exc)
-            if wait is not None:
-                # One retry, waiting exactly as long as the server asked.
-                await asyncio.sleep(wait)
-                try:
-                    _, data, url = await _api_request("GET", "/chats", query=query)
-                except Exception as retry_exc:  # noqa: BLE001 - handled below
-                    exc = retry_exc
-                else:
-                    exc = None  # type: ignore[assignment]
-
-            if exc is not None:
-                # Whatever was counted so far is still worth returning. Discarding
-                # 19 pages of work because the 20th was rate-limited leaves the
-                # caller with nothing, which is strictly worse than partial counts
-                # that are labelled as partial.
-                if counted == 0:
-                    return _format_error(exc, url)
-                stopped_early = _format_error(exc, url).split("\n")[0]
-                more_remaining = True
-                break
+            # Whatever was counted so far is still worth returning. Discarding 19
+            # pages of work because the 20th was rate-limited leaves the caller
+            # with nothing, which is strictly worse than partial counts that are
+            # labelled as partial.
+            if counted == 0:
+                return _format_error(exc, url)
+            stopped_early = _format_error(exc, url).split("\n")[0]
+            more_remaining = True
+            break
 
         records = _extract_records(data) or []
         for record in records:

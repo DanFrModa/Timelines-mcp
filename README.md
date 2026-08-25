@@ -159,14 +159,25 @@ Verificado contra la referencia pública (`https://timelines.ai/docs/public-api-
   | Volumen mensual | **200,000 llamadas** al mes | Todo |
   | Cuota de mensajería | según tu plan (créditos) | Solo envíos |
 
-  El primero es el que muerde al paginar: pasarse devuelve 429
-  `rate_limit_exceeded` **a media faena**, no al principio.
-  `timelines_activity_summary` se espacia 1.2 s entre páginas para quedar justo
-  dentro, reintenta una vez respetando el header `Retry-After`, y si aun así lo
-  cortan devuelve lo que alcanzó a contar con una nota `stopped_early` en vez de
-  tirar el trabajo. Para preguntas por persona conviene filtrar
-  (`responsible=alguien@...`) en lugar de escanear páginas: una petición en vez
-  de veinte. Se pueden pedir límites mayores escribiendo a hello@timelines.ai.
+  El primero es el que muerde: pasarse devuelve 429 `rate_limit_exceeded` **a
+  media faena**, no al principio.
+
+  El servidor se defiende en dos niveles, ambos en la capa de peticiones para
+  que **todas** las herramientas queden cubiertas, no solo las que paginan:
+
+  1. **Ritmo compartido.** Las llamadas se espacian 1.2 s entre sí (60÷50). Una
+     llamada suelta no espera nada; el retraso solo aparece en ráfagas, que es
+     justo el caso que topa el límite. El límite es por workspace y todas las
+     herramientas comparten uno, así que el marcapasos también es único.
+  2. **Reintento con `Retry-After`.** Un 429 en una **lectura** se reintenta una
+     vez, esperando exactamente lo que pide el servidor. Un **envío nunca se
+     reintenta solo**: un mensaje que quizá salió no se repite por corazonada.
+
+  `timelines_activity_summary` además devuelve lo que alcanzó a contar con una
+  nota `stopped_early` si aun así lo cortan. Para preguntas por persona conviene
+  filtrar (`responsible=alguien@...`) en lugar de escanear páginas: una petición
+  en vez de veinte. Se pueden pedir límites mayores escribiendo a
+  hello@timelines.ai.
 - **No hay endpoint de agregación.** Por eso `timelines_activity_summary`
   pagina y cuenta del lado del servidor MCP, y avisa con `complete=false`
   cuando el conteo no llegó al final.
