@@ -234,8 +234,8 @@ def _truncate(text: str, limit: int) -> str:
     return (
         text[:limit]
         + f"\n\n... [truncated: {len(text) - limit} more characters. "
-        "Narrow the request with a smaller `per_page`, more filters, or a `fields` "
-        "selection, or raise TIMELINES_MAX_CHARS.]"
+        "Narrow the request with more filters or a `fields` selection, or raise "
+        "TIMELINES_MAX_CHARS. Page size is fixed at 50 and cannot be lowered.]"
     )
 
 
@@ -517,12 +517,16 @@ class _Base(BaseModel):
 
 
 class ListInput(_Base):
-    """Shared pagination and shaping parameters for TimelinesAI list endpoints."""
+    """Shared pagination and shaping parameters for TimelinesAI list endpoints.
+
+    Page size is NOT adjustable. Verified against the live API on 2026-08-25:
+    ``limit``, ``per_page``, ``page_size``, ``size``, ``count``, ``take`` and
+    ``rows`` are all ignored and every page comes back with 50 records. Only
+    ``page`` does anything, and ``has_more_pages`` says whether to ask for the
+    next one.
+    """
 
     page: Optional[int] = Field(default=1, description="1-based page number", ge=1)
-    per_page: Optional[int] = Field(
-        default=50, description="Records per page (1-200)", ge=1, le=200
-    )
     extra_query: Optional[Dict[str, QueryValue]] = Field(
         default=None,
         description=(
@@ -544,8 +548,6 @@ class ListInput(_Base):
         query: Dict[str, QueryValue] = {}
         if self.page is not None:
             query["page"] = self.page
-        if self.per_page is not None:
-            query["per_page"] = self.per_page
         if self.extra_query:
             query.update(self.extra_query)
         return query
@@ -781,13 +783,13 @@ class ActivitySummaryInput(_Base):
     max_pages: int = Field(
         default=10,
         description=(
-            "Safety cap on pagination. Each page is up to 200 chats, so 10 pages covers "
-            "2000. Raise for big workspaces, but expect a slower call."
+            "Safety cap on pagination. The API returns a fixed 50 chats per page, so "
+            "10 pages covers 500. Raise for big workspaces, but expect a slower call: "
+            "each page is one round trip."
         ),
         ge=1,
-        le=50,
+        le=100,
     )
-    per_page: int = Field(default=200, description="Chats fetched per page", ge=1, le=200)
     filters: Optional[Dict[str, QueryValue]] = Field(
         default=None,
         description="Optional filters passed straight to /chats, e.g. {'group': False}",
@@ -853,7 +855,7 @@ async def timelines_whoami() -> str:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
             for path in probes:
                 url = _normalize_path(path)
-                params = {} if path == "/workspace" else {"per_page": "1"}
+                params: Dict[str, str] = {}
                 try:
                     response = await client.get(url, headers=headers, params=params)
                 except httpx.RequestError as exc:
@@ -999,7 +1001,7 @@ async def timelines_discover(params: DiscoverInput) -> str:
             for path in paths:
                 url = _normalize_path(path)
                 try:
-                    response = await client.get(url, headers=headers, params={"per_page": "1"})
+                    response = await client.get(url, headers=headers)
                 except httpx.RequestError as exc:
                     errors.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
                     continue
@@ -1053,7 +1055,7 @@ async def timelines_list_chats(params: ChatsInput) -> str:
             - group (Optional[bool]): True only groups, False only 1:1
             - name (Optional[str]): Substring match on the chat or contact name
             - created_after (Optional[str]): ISO 8601 date lower bound
-            - page, per_page: Pagination (defaults 1 and 50)
+            - page (Optional[int]): 1-based page. Page size is fixed at 50 by the API
             - extra_query (Optional[Dict]): Any further filters
             - fields (Optional[List[str]]): Keys to keep on each chat
             - response_format (ResponseFormat): 'json' or 'markdown'
@@ -1075,7 +1077,8 @@ async def timelines_list_chats(params: ChatsInput) -> str:
     Error Handling:
         - An empty result with filters set usually means the label or email does
           not match exactly; list without filters first to see the real values
-        - Big workspaces truncate; lower per_page or pass `fields`
+        - Big workspaces truncate; page size cannot be lowered, so pass `fields`
+          to keep only the keys you need
     """
     return await _run(
         "GET",
@@ -1146,7 +1149,7 @@ async def timelines_list_messages(params: MessagesInput) -> str:
     Args:
         params (MessagesInput): Validated parameters containing:
             - chat_id (int | str): The chat to read
-            - page, per_page: Pagination (defaults 1 and 50)
+            - page (Optional[int]): 1-based page. Page size is fixed at 50 by the API
             - extra_query (Optional[Dict]): Any further filters the API accepts
             - fields (Optional[List[str]]): Keys to keep on each message
             - response_format (ResponseFormat): 'json' or 'markdown'
@@ -1162,8 +1165,8 @@ async def timelines_list_messages(params: MessagesInput) -> str:
         - Don't use when: replying (use timelines_send_message)
 
     Error Handling:
-        - Long histories truncate; use per_page and `fields` rather than raising
-          the character limit, so the useful part is not buried
+        - Long histories truncate; page through with `page` and pass `fields`
+          rather than raising the character limit, so the useful part is not buried
     """
     query = params.to_query()
     return await _run(
@@ -1387,7 +1390,7 @@ async def timelines_list_whatsapp_accounts(params: ListInput) -> str:
     the user intends.
 
     Args:
-        params (ListInput): page, per_page, extra_query, fields, response_format.
+        params (ListInput): page, extra_query, fields, response_format.
 
     Returns:
         str: JSON of the shape {"status": int, "url": str, "data": <accounts payload>}.
@@ -1428,7 +1431,7 @@ async def timelines_list_teammates(params: ListInput) -> str:
     the lookup that makes those work.
 
     Args:
-        params (ListInput): page, per_page, extra_query, fields, response_format.
+        params (ListInput): page, extra_query, fields, response_format.
 
     Returns:
         str: JSON of the shape {"status": int, "url": str, "data": <teammates payload>}.
@@ -1471,8 +1474,8 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
 
     Args:
         params (ActivitySummaryInput): Validated parameters containing:
-            - max_pages (int): Pagination cap, up to 200 chats per page (default 10)
-            - per_page (int): Chats fetched per page (default 200)
+            - max_pages (int): Pagination cap; the API fixes 50 chats per page, so the
+              default of 10 covers 500 chats
             - filters (Optional[Dict]): Filters passed straight to /chats
 
     Returns:
@@ -1494,9 +1497,9 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
         - Don't use when: you need the chats themselves (use timelines_list_chats)
 
     Error Handling:
-        - complete=false means the inbox held more than max_pages*per_page chats
-          and the counts cover only what was scanned. Raise max_pages or filter;
-          do NOT report partial counts as final
+        - complete=false means the inbox held more than max_pages*50 chats and the
+          counts cover only what was scanned. Raise max_pages or filter; do NOT
+          report partial counts as final
     """
     totals = {"unread": 0, "open": 0, "closed": 0, "groups": 0, "direct": 0, "unassigned": 0}
     by_responsible: Dict[str, Dict[str, int]] = {}
@@ -1507,7 +1510,7 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
     url = _normalize_path("/chats")
 
     for page in range(1, params.max_pages + 1):
-        query: Dict[str, QueryValue] = {"page": page, "per_page": params.per_page}
+        query: Dict[str, QueryValue] = {"page": page}
         if params.filters:
             query.update(params.filters)
 

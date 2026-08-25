@@ -200,3 +200,7 @@ el `message` del cuerpo dice por qué (créditos agotados, número no conectado)
 
 **Los filtros no devuelven nada** → `label` y `responsible` son coincidencia
 exacta. Lista sin filtros primero y copia los valores tal cual salen.
+
+**Las respuestas salen truncadas** → el tamaño de página está fijo en 50 y la API
+ignora cualquier intento de bajarlo. Filtra más, o pide `fields` con solo las
+claves que te interesan.

@@ -27,7 +27,7 @@ genérica, una de descubrimiento, y un resumen agregado del inbox.
 | `timelines_manage_labels` | `GET/POST/PUT /chats/{id}/labels` |
 | `timelines_list_whatsapp_accounts` | `GET /whatsapp_accounts` |
 | `timelines_list_teammates` | `GET /workspace/teammates` |
-| `timelines_activity_summary` | pagina `/chats` y cuenta todo |
+| `timelines_activity_summary` | pagina `/chats` y cuenta todo (50 por página) |
 
 ---
 
@@ -132,10 +132,15 @@ Verificado contra la referencia pública (`https://timelines.ai/docs/public-api-
 - **Los filtros de varios valores van separados por coma** en un solo parámetro
   (`label=vip,enterprise`), no repetidos ni con corchetes. Pasar una lista de
   Python produce esa forma.
-- **La paginación se detecta por `has_more_pages`** en la respuesta. Los nombres
-  exactos de los parámetros de página no están documentados; el servidor usa
-  `page` y `per_page`. Si tu workspace responde distinto, `timelines_discover`
-  con `include_sample=True` te enseña la forma real del payload.
+- **El tamaño de página es fijo en 50 y no se puede cambiar.** Verificado
+  contra la API en vivo el 2026-08-25: `limit`, `per_page`, `page_size`, `size`,
+  `count`, `take` y `rows` se ignoran todos, y cada página llega con 50
+  registros. El único parámetro que hace algo es `page`, y `has_more_pages` en
+  la respuesta dice si hay otra. Por eso las herramientas no exponen un
+  `per_page`: sería un parámetro que aparenta ajustar y no ajusta nada.
+- **Para reducir el tamaño de una respuesta**, entonces, no queda bajar la
+  página: hay que filtrar más, o usar `fields` para quedarte solo con las claves
+  que necesitas.
 - **Los teléfonos van en formato internacional** con `+`: `+5215512345678`. El
   modelo lo valida antes de salir a la red y limpia espacios y guiones.
 - **`text` tiene tope de 2000 caracteres**; las etiquetas 64, los nombres de
