@@ -33,6 +33,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -302,7 +303,9 @@ def _format_error(exc: Exception, url: str) -> str:
             404: "Not found. The chat, message or file id does not exist in this workspace.",
             409: "Conflict. The resource is in a state that blocks this change.",
             422: "Validation failed. Inspect the per-field errors below.",
-            429: "Rate limited. TimelinesAI paces sends ~2s apart; slow down and retry.",
+            429: "Rate limited. This applies to READS too, not just sends: bursts of "
+                 "list requests trip it after roughly 20 in a row. Wait a few seconds "
+                 "and retry, and prefer filters over scanning many pages.",
         }
         hint = hints.get(status, "")
         if status >= 500:
@@ -1491,7 +1494,8 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
         str: JSON of the shape
             {
               "chats_counted": int,
-              "complete": bool,        # false when max_pages cut the scan short
+              "complete": bool,        # false when the scan did not reach the end
+              "stopped_early": str,    # present only when the API cut the scan short
               "totals": {"unread": int, "unattended": int, "open": int,
                          "closed": int, "groups": int, "direct": int,
                          "unassigned": int},
@@ -1508,6 +1512,9 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
         - Don't use when: you need the chats themselves (use timelines_list_chats)
 
     Error Handling:
+        - The API rate-limits reads, roughly after 20 rapid requests. This tool
+          paces itself, and if it is cut short anyway it returns what it counted
+          plus a "stopped_early" note rather than discarding the work
         - complete=false means the inbox held more than max_pages*50 chats and the
           counts cover only what was scanned. This is worse than merely incomplete:
           the pages come back in the API's order, not shuffled, and the early ones
@@ -1532,15 +1539,31 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
     more_remaining = False
     url = _normalize_path("/chats")
 
+    stopped_early: Optional[str] = None
+
     for page in range(1, params.max_pages + 1):
         query: Dict[str, QueryValue] = {"page": page}
         if params.filters:
             query.update(params.filters)
 
+        # TimelinesAI rate-limits reads, not just sends: an unpaced scan trips it
+        # around the 20th request. A short pause between pages keeps a long scan
+        # under the limit instead of losing it at page 20.
+        if page > 1:
+            await asyncio.sleep(0.4)
+
         try:
             _, data, url = await _api_request("GET", "/chats", query=query)
-        except Exception as exc:  # noqa: BLE001 - surfaced to the agent as text
-            return _format_error(exc, url)
+        except Exception as exc:  # noqa: BLE001 - handled below
+            # Whatever was counted so far is still worth returning. Discarding 19
+            # pages of work because the 20th was rate-limited leaves the caller
+            # with nothing, which is strictly worse than partial counts that are
+            # labelled as partial.
+            if counted == 0:
+                return _format_error(exc, url)
+            stopped_early = _format_error(exc, url).split("\n")[0]
+            more_remaining = True
+            break
 
         records = _extract_records(data) or []
         for record in records:
@@ -1605,14 +1628,24 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
         "by_label": dict(sorted(by_label.items(), key=lambda kv: kv[1], reverse=True)),
         "by_whatsapp_account": by_account,
     }
+    if stopped_early:
+        result["stopped_early"] = stopped_early
     if more_remaining:
+        how = f"before stopping early ({stopped_early})" if stopped_early \
+            else f"across {params.max_pages} pages"
+        tail = (
+            " The scan was cut short by the API, not by max_pages, so raising "
+            "max_pages alone will not help: wait a few seconds and use filters."
+            if stopped_early else
+            " Raise max_pages until complete is true, or narrow with filters so the "
+            "scan finishes."
+        )
         result["warning"] = (
-            f"Scanned {counted} chats across {params.max_pages} pages and more remain. "
+            f"Scanned {counted} chats {how} and more remain. "
             "These counts are PARTIAL AND NOT A REPRESENTATIVE SAMPLE: the API returns "
             "pages in its own order, and the early pages of this workspace skew heavily "
             "toward unassigned, unlabelled chats. Reporting these ratios as if they "
-            "described the whole inbox would be wrong. Raise max_pages until complete "
-            "is true, or narrow with filters so the scan finishes."
+            "described the whole inbox would be wrong." + tail
         )
     return _truncate(json.dumps(result, indent=2, ensure_ascii=False, default=str), MAX_CHARS)
 
