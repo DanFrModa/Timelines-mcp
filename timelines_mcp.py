@@ -1061,10 +1061,14 @@ async def timelines_list_chats(params: ChatsInput) -> str:
             - response_format (ResponseFormat): 'json' or 'markdown'
 
     Returns:
-        str: JSON of the shape {"status": int, "url": str, "data": {...}}. Chat
-            records carry id, name, phone, is_group, whatsapp_account_id,
-            responsible, closed and read. When another page exists the payload
-            says has_more_pages and a "next_page_hint" is added.
+        str: JSON of the shape {"status": int, "url": str, "data": {...}}. Verified
+            chat fields: id, name, phone, jid, photo, is_group, whatsapp_account_id
+            (a JID string, not a number), closed, read, unattended, labels,
+            responsible_email, responsible_name, chat_url, created_timestamp,
+            last_message_timestamp, last_message_uid, is_allowed_to_message.
+            Note the assignee is responsible_email on the RECORD, while the
+            query FILTER is called responsible. When another page exists the
+            payload says has_more_pages and a "next_page_hint" is added.
 
     Examples:
         - Use when: "What's unread?" -> read=False
@@ -1466,7 +1470,7 @@ async def timelines_list_teammates(params: ListInput) -> str:
     },
 )
 async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
-    """Count the whole inbox: unread, open, by owner, by label, groups vs 1:1.
+    """Count the whole inbox: unread, unattended, open, by owner, label and number.
 
     TimelinesAI has no aggregation endpoint, so this paginates /chats and counts
     here — the tally you would otherwise ask an agent to do by hand across
@@ -1483,8 +1487,9 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
             {
               "chats_counted": int,
               "complete": bool,        # false when max_pages cut the scan short
-              "totals": {"unread": int, "open": int, "closed": int,
-                         "groups": int, "direct": int, "unassigned": int},
+              "totals": {"unread": int, "unattended": int, "open": int,
+                         "closed": int, "groups": int, "direct": int,
+                         "unassigned": int},
               "by_responsible": {"ana@empresa.com": {"total": int, "unread": int}},
               "by_label": {"vip": int},
               "by_whatsapp_account": {"<id>": int}
@@ -1492,6 +1497,7 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
 
     Examples:
         - Use when: "How's the inbox looking?" -> run with defaults
+        - Use when: "What still needs a reply?" -> read totals.unattended
         - Use when: "Who has the most unread?" -> read by_responsible
         - Use when: "How many VIP chats are open?" -> filters={'label': 'vip'}
         - Don't use when: you need the chats themselves (use timelines_list_chats)
@@ -1501,7 +1507,15 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
           counts cover only what was scanned. Raise max_pages or filter; do NOT
           report partial counts as final
     """
-    totals = {"unread": 0, "open": 0, "closed": 0, "groups": 0, "direct": 0, "unassigned": 0}
+    totals = {
+        "unread": 0,
+        "unattended": 0,
+        "open": 0,
+        "closed": 0,
+        "groups": 0,
+        "direct": 0,
+        "unassigned": 0,
+    }
     by_responsible: Dict[str, Dict[str, int]] = {}
     by_label: Dict[str, int] = {}
     by_account: Dict[str, int] = {}
@@ -1536,9 +1550,17 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
             else:
                 totals["direct"] += 1
 
-            owner = record.get("responsible")
-            if isinstance(owner, dict):
-                owner = owner.get("email") or owner.get("name")
+            if record.get("unattended"):
+                totals["unattended"] += 1
+
+            # The chat record names the assignee "responsible_email" /
+            # "responsible_name" — there is no plain "responsible" key, which is
+            # only the name of the query FILTER. Reading the filter's name here
+            # silently counted every chat as unassigned.
+            owner = record.get("responsible_email") or record.get("responsible_name")
+            if owner is None:
+                legacy = record.get("responsible")
+                owner = legacy.get("email") or legacy.get("name") if isinstance(legacy, dict) else legacy
             if owner:
                 bucket = by_responsible.setdefault(str(owner), {"total": 0, "unread": 0})
                 bucket["total"] += 1
