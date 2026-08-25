@@ -151,12 +151,22 @@ Verificado contra la referencia pública (`https://timelines.ai/docs/public-api-
 - **Los envíos se espacian ~2 segundos** entre uno y otro por política de
   WhatsApp, y cada mensaje consume créditos (1 texto, 2 con adjunto; los
   fallidos se reembolsan).
-- **La API limita la tasa de LECTURAS, no solo de envíos.** Verificado: una
-  ráfaga de listados devuelve 429 `rate_limit_exceeded` alrededor de la petición
-  20. `timelines_activity_summary` se auto-espacia para no toparse, y si aun así
-  lo cortan devuelve lo que alcanzó a contar con una nota `stopped_early` en vez
-  de tirar el trabajo. Para preguntas por persona conviene filtrar
-  (`responsible=alguien@...`) en lugar de escanear páginas.
+- **Hay tres límites distintos y conviene no confundirlos:**
+
+  | Límite | Valor | Aplica a |
+  |---|---|---|
+  | Tasa de peticiones | **50 por minuto** por workspace | **Todo**, lecturas incluidas |
+  | Volumen mensual | **200,000 llamadas** al mes | Todo |
+  | Cuota de mensajería | según tu plan (créditos) | Solo envíos |
+
+  El primero es el que muerde al paginar: pasarse devuelve 429
+  `rate_limit_exceeded` **a media faena**, no al principio.
+  `timelines_activity_summary` se espacia 1.2 s entre páginas para quedar justo
+  dentro, reintenta una vez respetando el header `Retry-After`, y si aun así lo
+  cortan devuelve lo que alcanzó a contar con una nota `stopped_early` en vez de
+  tirar el trabajo. Para preguntas por persona conviene filtrar
+  (`responsible=alguien@...`) en lugar de escanear páginas: una petición en vez
+  de veinte. Se pueden pedir límites mayores escribiendo a hello@timelines.ai.
 - **No hay endpoint de agregación.** Por eso `timelines_activity_summary`
   pagina y cuenta del lado del servidor MCP, y avisa con `complete=false`
   cuando el conteo no llegó al final.

@@ -88,6 +88,17 @@ ALLOW_SEND: bool = os.environ.get("TIMELINES_ALLOW_SEND", "").strip().lower() in
 
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# TimelinesAI documents 50 requests/minute per workspace, plus a monthly cap of
+# 200,000 calls. The per-minute figure is what a paginating scan runs into, so
+# anything that loops over pages has to space itself out by at least this much.
+# Going faster does not fail loudly: it returns 429 partway through, after the
+# work is already half done.
+READ_RATE_LIMIT_PER_MIN = 50
+MIN_REQUEST_INTERVAL = 60.0 / READ_RATE_LIMIT_PER_MIN  # 1.2 seconds
+
+# Fallback wait when a 429 arrives without a Retry-After header.
+DEFAULT_RETRY_AFTER = 5.0
+
 # Paths that put a message on someone's phone. Matched as prefixes against the
 # normalized path; any POST landing here needs ALLOW_SEND *and* confirm=True.
 SEND_PATH_MARKERS: Tuple[str, ...] = (
@@ -303,9 +314,10 @@ def _format_error(exc: Exception, url: str) -> str:
             404: "Not found. The chat, message or file id does not exist in this workspace.",
             409: "Conflict. The resource is in a state that blocks this change.",
             422: "Validation failed. Inspect the per-field errors below.",
-            429: "Rate limited. This applies to READS too, not just sends: bursts of "
-                 "list requests trip it after roughly 20 in a row. Wait a few seconds "
-                 "and retry, and prefer filters over scanning many pages.",
+            429: f"Rate limited. TimelinesAI allows {READ_RATE_LIMIT_PER_MIN} requests "
+                 "per minute per workspace (plus 200,000 calls a month), and this applies "
+                 "to READS, not just sends. Respect the Retry-After header on the response, "
+                 "and prefer filters over scanning many pages.",
         }
         hint = hints.get(status, "")
         if status >= 500:
@@ -320,6 +332,26 @@ def _format_error(exc: Exception, url: str) -> str:
     if isinstance(exc, httpx.RequestError):
         return f"Error: could not reach {url} ({type(exc).__name__}: {exc})."
     return f"Error: unexpected {type(exc).__name__}: {exc}"
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Seconds to wait per the server's Retry-After header, when it sent one.
+
+    TimelinesAI returns Retry-After on a 429. Honouring it beats guessing: too
+    short and the retry is refused again, too long and a scan crawls.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    if exc.response.status_code != 429:
+        return None
+    raw = exc.response.headers.get("retry-after", "").strip()
+    if not raw:
+        return DEFAULT_RETRY_AFTER
+    try:
+        return max(0.0, min(float(raw), 120.0))
+    except ValueError:
+        # The header may be an HTTP date rather than a count of seconds.
+        return DEFAULT_RETRY_AFTER
 
 
 def _check_write_allowed(method: str, path: str, confirmed: bool) -> None:
@@ -1487,7 +1519,8 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
     Args:
         params (ActivitySummaryInput): Validated parameters containing:
             - max_pages (int): Pagination cap; the API fixes 50 chats per page, so the
-              default of 10 covers 500 chats
+              default of 10 covers 500 chats. Each page is paced 1.2s apart to stay
+              within the rate limit, so a 100-page scan takes about two minutes
             - filters (Optional[Dict]): Filters passed straight to /chats
 
     Returns:
@@ -1512,9 +1545,11 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
         - Don't use when: you need the chats themselves (use timelines_list_chats)
 
     Error Handling:
-        - The API rate-limits reads, roughly after 20 rapid requests. This tool
-          paces itself, and if it is cut short anyway it returns what it counted
-          plus a "stopped_early" note rather than discarding the work
+        - TimelinesAI allows 50 requests/minute per workspace, and reads count.
+          This tool paces itself at that rate and retries once honouring the
+          Retry-After header; if it is cut short anyway it returns what it counted
+          plus a "stopped_early" note rather than discarding the work. A full scan
+          is therefore slow by design: roughly 1.2 seconds per 50 chats
         - complete=false means the inbox held more than max_pages*50 chats and the
           counts cover only what was scanned. This is worse than merely incomplete:
           the pages come back in the API's order, not shuffled, and the early ones
@@ -1546,24 +1581,36 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
         if params.filters:
             query.update(params.filters)
 
-        # TimelinesAI rate-limits reads, not just sends: an unpaced scan trips it
-        # around the 20th request. A short pause between pages keeps a long scan
-        # under the limit instead of losing it at page 20.
+        # Stay under the documented 50 requests/minute. A scan is the one place
+        # that reliably exceeds it, and exceeding it fails halfway rather than
+        # up front.
         if page > 1:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(MIN_REQUEST_INTERVAL)
 
         try:
             _, data, url = await _api_request("GET", "/chats", query=query)
         except Exception as exc:  # noqa: BLE001 - handled below
-            # Whatever was counted so far is still worth returning. Discarding 19
-            # pages of work because the 20th was rate-limited leaves the caller
-            # with nothing, which is strictly worse than partial counts that are
-            # labelled as partial.
-            if counted == 0:
-                return _format_error(exc, url)
-            stopped_early = _format_error(exc, url).split("\n")[0]
-            more_remaining = True
-            break
+            wait = _retry_after_seconds(exc)
+            if wait is not None:
+                # One retry, waiting exactly as long as the server asked.
+                await asyncio.sleep(wait)
+                try:
+                    _, data, url = await _api_request("GET", "/chats", query=query)
+                except Exception as retry_exc:  # noqa: BLE001 - handled below
+                    exc = retry_exc
+                else:
+                    exc = None  # type: ignore[assignment]
+
+            if exc is not None:
+                # Whatever was counted so far is still worth returning. Discarding
+                # 19 pages of work because the 20th was rate-limited leaves the
+                # caller with nothing, which is strictly worse than partial counts
+                # that are labelled as partial.
+                if counted == 0:
+                    return _format_error(exc, url)
+                stopped_early = _format_error(exc, url).split("\n")[0]
+                more_remaining = True
+                break
 
         records = _extract_records(data) or []
         for record in records:
