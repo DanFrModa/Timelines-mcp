@@ -140,7 +140,14 @@ Verificado contra la referencia pública (`https://timelines.ai/docs/public-api-
   `per_page`: sería un parámetro que aparenta ajustar y no ajusta nada.
 - **Para reducir el tamaño de una respuesta**, entonces, no queda bajar la
   página: hay que filtrar más, o usar `fields` para quedarte solo con las claves
-  que necesitas.
+  que necesitas. Los mensajes son el caso que más lo pide — un chat con 50
+  mensajes se pasa del límite de caracteres sin problema. `fields=["uid","text",
+  "from_me","timestamp"]` deja lo esencial de una conversación en una fracción
+  del tamaño.
+- **Ojo con los nombres de campo repetidos:** un registro de mensaje trae su
+  propia clave `data` (un dict de metadatos), además del `data` de la envoltura.
+  Por eso `fields` decide qué podar **por posición** (lo que está dentro de una
+  lista es un registro) y no por el nombre de la clave.
 - **Los teléfonos van en formato internacional** con `+`: `+5215512345678`. El
   modelo lo valida antes de salir a la red y limpia espacios y guiones.
 - **`text` tiene tope de 2000 caracteres**; las etiquetas 64, los nombres de

@@ -252,30 +252,43 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _select_fields(data: Any, fields: Optional[Sequence[str]]) -> Any:
-    """Keep only ``fields`` on each object, to reduce response size.
+    """Keep only ``fields`` on each record, to reduce response size.
 
     TimelinesAI wraps payloads as {"status":"ok","data":{...}}, and list payloads
-    carry a "has_more_pages" flag beside the records. Container keys are walked
-    through rather than pruned so that metadata survives.
+    carry a "has_more_pages" flag beside the records, so envelope keys have to be
+    walked through rather than pruned or the pagination metadata disappears.
+
+    Identifying the envelope by key name alone does not survive contact with this
+    API: a message record has its own key called ``data`` (a dict of metadata),
+    so a name-based test reads every message as an envelope and prunes nothing.
+    The reliable signal is position — **anything inside a list is a record** — and
+    that is what decides here. Key names are only consulted for dicts, where
+    there is no list to go by.
+
+    Since page size is fixed at 50, `fields` is the only lever left for keeping a
+    response readable, so it failing silently is worse than it not existing.
     """
     if not fields:
         return data
     keep = set(fields)
     containers = ("data", "chats", "messages", "items", "results", "records")
 
-    def prune(node: Any) -> Any:
-        if isinstance(node, list):
-            return [prune(item) for item in node]
+    def prune_record(node: Any) -> Any:
         if isinstance(node, dict):
-            if any(k in node for k in containers):
-                return {
-                    k: (prune(v) if k in containers else v)
-                    for k, v in node.items()
-                }
             return {k: v for k, v in node.items() if k in keep}
         return node
 
-    return prune(data)
+    def walk(node: Any) -> Any:
+        if isinstance(node, list):
+            # List members are records, whatever their keys happen to be called.
+            return [prune_record(item) for item in node]
+        if isinstance(node, dict):
+            if any(k in containers for k in node):
+                return {k: (walk(v) if k in containers else v) for k, v in node.items()}
+            return prune_record(node)
+        return node
+
+    return walk(data)
 
 
 def _format_error(exc: Exception, url: str) -> str:
