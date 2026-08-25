@@ -1476,6 +1476,11 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
     here — the tally you would otherwise ask an agent to do by hand across
     hundreds of records, done exactly and without spending context on the rows.
 
+    Note on assignment: the chat record carries the owner in `responsible_email`,
+    while the query filter for the same thing is called `responsible`. Filtering by
+    a teammate's email is the reliable way to count one person's chats without
+    scanning the whole inbox.
+
     Args:
         params (ActivitySummaryInput): Validated parameters containing:
             - max_pages (int): Pagination cap; the API fixes 50 chats per page, so the
@@ -1504,8 +1509,12 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
 
     Error Handling:
         - complete=false means the inbox held more than max_pages*50 chats and the
-          counts cover only what was scanned. Raise max_pages or filter; do NOT
-          report partial counts as final
+          counts cover only what was scanned. This is worse than merely incomplete:
+          the pages come back in the API's order, not shuffled, and the early ones
+          skew toward unassigned and unlabelled chats. A partial run can therefore
+          say "100 unassigned, 0 per person" about an inbox where hundreds of chats
+          do have owners. Raise max_pages until complete is true, or filter, before
+          reporting any ratio
     """
     totals = {
         "unread": 0,
@@ -1599,7 +1608,11 @@ async def timelines_activity_summary(params: ActivitySummaryInput) -> str:
     if more_remaining:
         result["warning"] = (
             f"Scanned {counted} chats across {params.max_pages} pages and more remain. "
-            "These counts are PARTIAL. Raise max_pages or narrow with filters."
+            "These counts are PARTIAL AND NOT A REPRESENTATIVE SAMPLE: the API returns "
+            "pages in its own order, and the early pages of this workspace skew heavily "
+            "toward unassigned, unlabelled chats. Reporting these ratios as if they "
+            "described the whole inbox would be wrong. Raise max_pages until complete "
+            "is true, or narrow with filters so the scan finishes."
         )
     return _truncate(json.dumps(result, indent=2, ensure_ascii=False, default=str), MAX_CHARS)
 
